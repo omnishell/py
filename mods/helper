@@ -1,0 +1,1065 @@
+#! /bin/bash
+
+__helper__() {
+    declare -ga __PY_IGNORE=(
+        "build/"
+        "dist/"
+        "__pycache__/"
+        "*.py[oc]"
+        "wheels/"
+        "*.egg-info"
+        ".env"
+    )
+
+    __py_load_omnirc() {
+        declare -gA PY_PROVIDERS 2>/dev/null || true
+        declare -gA PY_PROJS 2>/dev/null || true
+        declare -gA PY_PROJ_LIBS 2>/dev/null || true
+        declare -gA PY_PROJ_DEPS 2>/dev/null || true
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        if [[ -f "$target" ]]; then
+            source "$target"
+        fi
+        [[ -z "${PY_PROVIDERS[pypi]:-}" ]] && PY_PROVIDERS[pypi]="type:registry"
+        [[ -z "${PY_PROVIDERS[github]:-}" ]] && PY_PROVIDERS[github]="type:git"
+    }
+
+    __py_save_omnirc() {
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        local tmp="${target}.tmp"
+        local in_block=0
+        if [[ -f "$target" ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" == "# --- PY AUTO START ---" ]]; then in_block=1; continue; fi
+                if [[ "$line" == "# --- PY AUTO END ---" ]]; then in_block=0; continue; fi
+                if (( in_block == 0 )); then printf "%s\n" "$line" >> "$tmp"; fi
+            done < "$target"
+        else
+            touch "$tmp"
+        fi
+        {
+            echo "# --- PY AUTO START ---"
+            echo "declare -gA PY_PROVIDERS 2>/dev/null || true"
+            for k in "${!PY_PROVIDERS[@]}"; do echo "PY_PROVIDERS[\"$k\"]=\"${PY_PROVIDERS[$k]}\""; done
+            echo "declare -gA PY_PROJS 2>/dev/null || true"
+            for k in "${!PY_PROJS[@]}"; do echo "PY_PROJS[\"$k\"]=\"${PY_PROJS[$k]}\""; done
+            echo "declare -gA PY_PROJ_LIBS 2>/dev/null || true"
+            for k in "${!PY_PROJ_LIBS[@]}"; do echo "PY_PROJ_LIBS[\"$k\"]=\"${PY_PROJ_LIBS[$k]}\""; done
+            echo "declare -gA PY_PROJ_DEPS 2>/dev/null || true"
+            for k in "${!PY_PROJ_DEPS[@]}"; do echo "PY_PROJ_DEPS[\"$k\"]=\"${PY_PROJ_DEPS[$k]}\""; done
+            echo "# --- PY AUTO END ---"
+        } >> "$tmp"
+        mv "$tmp" "$target"
+    }
+
+    __py_helper_find_root() {
+        local dir="$PWD"
+        while [[ "$dir" != "" ]]; do
+            if [[ -f "$dir/pyproject.toml" ]]; then
+                echo "$dir"
+                return 0
+            fi
+            [[ "$dir" == "/" ]] && break
+            dir="${dir%/*}"
+            [[ -z "$dir" ]] && dir="/"
+        done
+        return 1
+    }
+
+    __py_get_proj_name() {
+        local root
+        if root=$(__py_helper_find_root 2>/dev/null); then
+            awk -F'"' '/^name[[:space:]]*=[[:space:]]*"/ {print $2; exit}' "$root/pyproject.toml"
+        fi
+    }
+
+    __py_helper_inside() {
+        if [[ -n "$(__py_helper_find_root)" ]]; then
+            return 0
+        else
+            __log "You are not in a Python initialized directory." -t error -l py
+            return 1
+        fi
+    }
+
+    __py_helper_env() {
+        local e="$1"
+        if [[ -z "$e" ]]; then echo "main"; else echo "$e"; fi
+    }
+
+    __py_helper_env_dir() {
+        local env="$1"
+        local root
+        root=$(__py_helper_find_root) || return 1
+        echo "${root}/.venv${env:+.${env}}"
+    }
+
+    __py_helper_site_dir() {
+        local env="$1"
+        local envdir
+        envdir=$(__py_helper_env_dir "$env") || return 1
+        local py_dir=""
+        if [[ -d "$envdir/lib" ]]; then
+            for d in "$envdir/lib"/python*; do
+                if [[ -d "$d" ]]; then
+                    py_dir="$d"
+                    break
+                fi
+            done
+        fi
+        if [[ -z "$py_dir" ]]; then
+            echo "${envdir}/lib/python/site-packages"
+        else
+            echo "${py_dir}/site-packages"
+        fi
+    }
+
+    __py_helper_provider() {
+        __py_load_omnirc
+        local action="$1"; shift
+        case "$action" in
+            set|new)
+                local name="$1"; shift
+                local type="" url="" user="" pass=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --t|--type) type="$2"; shift 2 ;;
+                        --u|--url) url="$2"; shift 2 ;;
+                        --user) user="$2"; shift 2 ;;
+                        --pass) pass="$2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                [[ -z "$type" ]] && { __log "Type required." -t error -l py; return 1; }
+                local val="type:$type"
+                [[ -n "$url" ]] && val+=",url:$url"
+                [[ -n "$user" ]] && val+=",user:$user"
+                [[ -n "$pass" ]] && val+=",pass:$pass"
+                PY_PROVIDERS["$name"]="$val"
+                __py_save_omnirc
+                __log "Provider '$name' added." -t success -l py
+                ;;
+            ls)
+                for k in "${!PY_PROVIDERS[@]}"; do printf "%-15s %s\n" "$k" "${PY_PROVIDERS[$k]}"; done
+                ;;
+            rm)
+                unset 'PY_PROVIDERS[$1]'
+                __py_save_omnirc
+                __log "Provider '$1' removed." -t success -l py
+                ;;
+        esac
+    }
+
+    __py_proj_build() {
+        if ! __py_helper_inside; then
+            return 1
+        fi
+        local root pyproject env=""
+        root=$(__py_helper_find_root)
+        pyproject="$root/pyproject.toml"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -e|--env)
+                    env="$2"
+                    shift 2
+                    ;;
+                -h|--help)
+                    printf "Usage: py build [options]\nBuild the current Python package\n\nOptions:\n  -e, --env <env>        Specify environment\n  -h, --help             Show this help message\n"
+                    return 0
+                    ;;
+                *)
+                    printf "py:error: Unknown option: %s\n" "$1" >&2
+                    return 1
+                    ;;
+            esac
+        done
+        if [[ ! -f "$pyproject" ]]; then
+            printf "py:error: pyproject.toml not found.\n" >&2
+            return 1
+        fi
+        printf "py:info: Cleaning previous builds...\n"
+        rm -rf "$root/build" "$root/dist" "$root"/*.egg-info 2>/dev/null
+        mkdir -p "$root/dist"
+        local name version description include_str in_find=0 line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%%#*}"
+            [[ -z "$line" ]] && continue
+            
+            [[ "$line" =~ ^[[:space:]]*name[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]] && name="${BASH_REMATCH[1]}"
+            [[ "$line" =~ ^[[:space:]]*version[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]] && version="${BASH_REMATCH[1]}"
+            [[ "$line" =~ ^[[:space:]]*description[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]] && description="${BASH_REMATCH[1]}"
+            if [[ "$line" == "[tool.setuptools.packages.find]"* ]]; then
+                in_find=1
+                continue
+            fi
+            
+            if (( in_find )); then
+                if [[ "$line" == "["* ]]; then
+                    in_find=0
+                elif [[ "$line" =~ ^[[:space:]]*include[[:space:]]*=[[:space:]]*\[(.*)\] ]]; then
+                    include_str="${BASH_REMATCH[1]}"
+                    include_str="${include_str//\"/}"
+                    include_str="${include_str//\'/}"
+                    include_str="${include_str//,/ }"
+                fi
+            fi
+        done < "$pyproject"
+        name="${name:-${root##*/}}"
+        name="${name//-/_}"
+        version="${version:-0.1.0}"
+        description="${description:-}"
+        local -a patterns=()
+        if [[ -n "$include_str" ]]; then
+            read -ra patterns <<< "$include_str"
+        fi
+        if [[ ${#patterns[@]} -eq 0 ]]; then
+            printf "py:warn: No [tool.setuptools.packages.find.include] patterns found; no packages will be copied.\n" >&2
+        fi
+        printf "py:info: Creating source distribution...\n"
+        local temp_dir="$root/dist/${name}-${version}"
+        mkdir -p "$temp_dir"
+        cp "$pyproject" "$temp_dir/"
+        local meta
+        shopt -s nullglob
+        for meta in "$root"/README* "$root"/LICENSE*; do
+            [[ -f "$meta" ]] && cp "$meta" "$temp_dir/"
+        done
+        shopt -u nullglob
+        local entry base pat matched
+        for entry in "$root"/*; do
+            [[ -d "$entry" ]] || continue
+            base="${entry##*/}"
+            case "$base" in
+                dist|build|.venv*|.git|__pycache__|*.egg-info) continue ;;
+            esac
+            matched=false
+            for pat in "${patterns[@]}"; do
+                if [[ "$base" == $pat ]]; then
+                    matched=true
+                    break
+                fi
+            done
+            $matched || continue
+            if [[ -f "$entry/__init__.py" ]]; then
+                cp -r "$entry" "$temp_dir/"
+            else
+                printf "py:warn: Directory '%s' matches include pattern but has no __init__.py; skipping.\n" "$base" >&2
+            fi
+        done
+        printf "Metadata-Version: 2.1\nName: %s\nVersion: %s\nSummary: %s\n" \
+            "${name}" "${version}" "${description}" > "$temp_dir/PKG-INFO"
+        cd "$root/dist" || return 1
+        tar -czf "${name}-${version}.tar.gz" "${name}-${version}" >/dev/null 2>&1
+        local ret=$?
+        cd "$root" || return 1
+        if [[ $ret -eq 0 && -f "$root/dist/${name}-${version}.tar.gz" ]]; then
+            rm -rf "$temp_dir"
+            printf "py:success: Source distribution built successfully: %s-%s.tar.gz\n" "$name" "$version"
+        else
+            printf "py:error: Failed to create source distribution.\n" >&2
+            rm -rf "$temp_dir" 2>/dev/null
+            return 1
+        fi
+    }
+
+    __py_helper_push() {
+        if ! __py_helper_inside; then
+            return 1
+        fi
+
+        local root pyproject registry="" env="" repo_url="" username="" password=""
+        root=$(__py_helper_find_root)
+        pyproject="$root/pyproject.toml"
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -r|--registry) registry="$2"; shift 2 ;;
+                -e|--env)      env="$2";      shift 2 ;;
+                -u|--username|--user) username="$2"; shift 2 ;;
+                -p|--password|--pass) password="$2"; shift 2 ;;
+                --repo-url|--url) repo_url="$2"; shift 2 ;;
+                -h|--help)
+                    printf "Usage: py push [options]\nPublish the built package to a registry\n\nOptions:\n  -r, --registry <name>  Registry name (pypi|testpypi|URL)\n  -e, --env <env>        Specify environment\n  -u, --username <user>  Username for authentication\n  -p, --password <pass>  Password for authentication\n  --repo-url <url>       Direct repository URL\n  -h, --help             Show this help message\n"
+                    return 0
+                    ;;
+                *)
+                    printf "py:error: Unknown option: %s\n" "$1" >&2
+                    return 1
+                    ;;
+            esac
+        done
+
+        if [[ ! -f "$pyproject" ]]; then
+            printf "py:error: pyproject.toml not found.\n" >&2
+            return 1
+        fi
+
+        shopt -s nullglob
+        local dist_files=("$root/dist/"*.tar.gz "$root/dist/"*.whl)
+        shopt -u nullglob
+
+        if [[ ${#dist_files[@]} -eq 0 ]]; then
+            printf "py:error: No built packages found. Run 'py build' first.\n" >&2
+            return 1
+        fi
+
+        local package_name="" package_version="" package_summary="" line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ -z "$package_name" && "$line" =~ ^[[:space:]]*name[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]]; then
+                package_name="${BASH_REMATCH[1]}"
+            elif [[ -z "$package_version" && "$line" =~ ^[[:space:]]*version[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]]; then
+                package_version="${BASH_REMATCH[1]}"
+            elif [[ -z "$package_summary" && "$line" =~ ^[[:space:]]*description[[:space:]]*=[[:space:]]*[\"\']([^\"\']+)[\"\'] ]]; then
+                package_summary="${BASH_REMATCH[1]}"
+            fi
+        done < "$pyproject"
+
+        package_name=${package_name:-${root##*/}}
+        package_version=${package_version:-"0.1.0"}
+        package_summary=${package_summary:-""}
+
+        local upload_url="$repo_url"
+        if [[ -n "$registry" && -z "$upload_url" ]]; then
+            case "$registry" in
+                pypi|pyPi|PyPI) upload_url="https://upload.pypi.org/legacy/" ;;
+                testpypi|test)  upload_url="https://test.pypi.org/legacy/" ;;
+                *)              upload_url="$registry" ;;
+            esac
+        fi
+        if [[ -z "$upload_url" ]]; then
+            upload_url="https://upload.pypi.org/legacy/"
+            printf "py:warn: No registry specified, using PyPI by default.\n" >&2
+        fi
+
+        local curl_auth=() has_auth=0
+        if [[ -n "$username" && -n "$password" ]]; then
+            curl_auth=(-u "${username}:${password}")
+            has_auth=1
+        elif [[ -n "$PYPI_API_TOKEN" ]]; then
+            curl_auth=(-u "__token__:${PYPI_API_TOKEN}")
+            has_auth=1
+        fi
+
+        if (( has_auth == 0 )); then
+            printf "py:warn: No authentication provided. You may need to provide credentials.\n" >&2
+        fi
+
+        printf "py:info: Publishing package to %s...\n" "$upload_url"
+
+        local upload_success=0 dist_file
+        for dist_file in "${dist_files[@]}"; do
+            local filename="${dist_file##*/}"
+            local filetype="sdist" pyversion="source"
+            
+            if [[ "$filename" == *.whl ]]; then
+                filetype="bdist_wheel"
+                pyversion=""
+            fi
+
+            local sha256_digest _
+            if command -v sha256sum >/dev/null 2>&1; then
+                read -r sha256_digest _ < <(sha256sum "$dist_file")
+            elif command -v shasum >/dev/null 2>&1; then
+                read -r sha256_digest _ < <(shasum -a 256 "$dist_file")
+            else
+                printf "py:error: Neither 'sha256sum' nor 'shasum' found. Cannot compute SHA256 digest.\n" >&2
+                return 1
+            fi
+
+            printf "py:info: Uploading %s...\n" "$filename"
+
+            local curl_output http_code curl_exit_code
+            curl_output=$(curl -sS -w "\n%{http_code}" \
+                "${curl_auth[@]}" \
+                -F ":action=file_upload" \
+                -F "protocol_version=1" \
+                -F "metadata_version=2.1" \
+                -F "name=${package_name}" \
+                -F "version=${package_version}" \
+                -F "summary=${package_summary}" \
+                -F "filetype=${filetype}" \
+                -F "pyversion=${pyversion}" \
+                -F "sha256_digest=${sha256_digest}" \
+                -F "content=@${dist_file}" \
+                "$upload_url" 2>&1)
+            
+            curl_exit_code=$?
+            http_code="${curl_output##*$'\n'}"
+            curl_output="${curl_output%$'\n'*}"
+
+            if [[ $curl_exit_code -eq 0 && ($http_code -eq 200 || $http_code -eq 201) ]]; then
+                printf "py:success: Successfully uploaded %s\n" "$filename"
+                upload_success=1
+            else
+                printf "py:error: Failed to upload %s\n" "$filename" >&2
+                printf "py:error: HTTP status code: %s\n" "$http_code" >&2
+                if [[ $http_code -eq 401 ]]; then
+                    printf "py:error: Authentication failed. Check your credentials or API token.\n" >&2
+                elif [[ $http_code -eq 403 ]]; then
+                    printf "py:error: Forbidden. You may not have permission to upload this package.\n" >&2
+                elif [[ $http_code -eq 400 ]]; then
+                    printf "py:error: Bad request. Check package name, version, dist file, and that this version isn't already uploaded.\n%s\n" "$curl_output" >&2
+                elif [[ $http_code -eq 405 ]]; then
+                    printf "py:error: Method not allowed – often caused by wrong fields to the legacy endpoint.\n" >&2
+                else
+                    printf "py:error: Response from server:\n%s\n" "$curl_output" >&2
+                fi
+            fi
+        done
+
+        if (( upload_success == 1 )); then
+            printf "py:success: Package published successfully.\n"
+        else
+            printf "py:error: Failed to publish package.\n" >&2
+            return 1
+        fi
+    }   
+
+    __py_helper_version() {
+        local root pyproject
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        pyproject="$root/pyproject.toml"
+        [[ ! -f "$pyproject" ]] && { __log "pyproject.toml not found." -t error -l py; return 1; }
+
+        local curr_ver=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*version[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                curr_ver="${BASH_REMATCH[1]}"
+                break
+            fi
+        done < "$pyproject"
+
+        [[ -z "$curr_ver" ]] && { __log "Version not found." -t error -l py; return 1; }
+
+        if [[ $# -eq 0 ]]; then
+            echo "$curr_ver"
+            return 0
+        fi
+
+        local cmd="$1"; shift
+        local new_ver=""
+
+        if [[ "$cmd" == "up" || "$cmd" == "down" ]]; then
+            local kind="$1" major minor patch
+            IFS='.' read -r major minor patch <<< "$curr_ver"
+            major=${major:-0}; minor=${minor:-0}; patch=${patch:-0}
+
+            if [[ "$cmd" == "up" ]]; then
+                case "$kind" in
+                    major) ((major++)); minor=0; patch=0 ;;
+                    minor) ((minor++)); patch=0 ;;
+                    patch) ((patch++)) ;;
+                esac
+            else
+                case "$kind" in
+                    major) ((major > 0)) && ((major--)); minor=0; patch=0 ;;
+                    minor) ((minor > 0)) && ((minor--)); patch=0 ;;
+                    patch) ((patch > 0)) && ((patch--)) ;;
+                esac
+            fi
+            new_ver="${major}.${minor}.${patch}"
+        elif [[ "$cmd" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            new_ver="$cmd"
+        fi
+
+        [[ -z "$new_ver" ]] && { __log "Invalid version specification." -t error -l py; return 1; }
+
+        local tmp="${pyproject}.tmp"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*version[[:space:]]*=[[:space:]]*\"([^\"]+)\"(,?) ]]; then
+                echo "${line%%version*}version = \"$new_ver\"${BASH_REMATCH[2]}"
+            else
+                printf "%s\n" "$line"
+            fi
+        done < "$pyproject" > "$tmp"
+        mv "$tmp" "$pyproject"
+
+        __log "Version updated: $curr_ver -> $new_ver" -t success -l py
+    }
+
+    __py_helper_proj() {
+        __py_load_omnirc
+        local action="$1"; shift
+        case "$action" in
+            set|new)
+                local name="$1"; shift
+                local dir=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in 
+                        -d|--d|--dir) dir="$2"; shift 2 ;; 
+                        *) shift ;; 
+                    esac
+                done
+                [[ -z "$dir" ]] && dir="$PWD"
+                if [[ ! -f "$dir/pyproject.toml" ]]; then
+                    __log "pyproject.toml not found in $dir." -t error -l py
+                    return 1
+                fi
+                if [[ -z "$name" || "$name" == "-d" || "$name" == "--d" || "$name" == "--dir" ]]; then
+                    name=$(awk -F'"' '/^name[[:space:]]*=[[:space:]]*"/ {print $2; exit}' "$dir/pyproject.toml")
+                fi
+                PY_PROJS["$name"]="dir:$dir"
+                __py_save_omnirc
+                __log "Project '$name' registered." -t success -l py
+                ;;
+            ls)
+                for k in "${!PY_PROJS[@]}"; do printf "%-20s %s\n" "$k" "${PY_PROJS[$k]}"; done
+                ;;
+            rm)
+                unset 'PY_PROJS[$1]'
+                __py_save_omnirc
+                __log "Project '$1' removed." -t success -l py
+                ;;
+            build)
+                __py_proj_build "$@"
+                ;;
+            push|publish)
+                __py_helper_push "$@"
+                ;;
+            version|v)
+                __py_helper_version "$@"
+                ;;
+            *)
+                __log "Unknown proj command: $action" -t error -l py
+                return 1
+                ;;
+        esac
+    }    
+
+    __py_helper_init() {
+        local env=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -*) shift 2 ;;
+                *) env="$1"; shift ;;
+            esac
+        done
+        local root project_name="" pyproject=""
+        root=$(__py_helper_find_root 2>/dev/null)
+        
+        if [[ -z "$root" ]]; then
+            root="$PWD"
+            project_name="${root##*/}"
+            [[ -n "$env" && "$env" != "main" ]] && project_name="$env"
+            pyproject="$root/pyproject.toml"
+            cat > "$pyproject" <<EOF
+[project]
+name = "$project_name"
+version = "0.0.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["${project_name}*"]
+EOF
+        else
+            project_name=$(__py_get_proj_name)
+        fi
+        
+        __py_helper_proj set "$project_name" -d "$root"
+        
+        [[ -f "$root/.env${env:+.$env}" ]] || touch "$root/.env${env:+.$env}"
+        local req_file="$root/requirements${env:+.${env}}.txt"
+        [[ -f "$req_file" ]] || touch "$req_file"
+        
+        local envdir="$root/.venv${env:+.${env}}"
+        mkdir -p "$envdir"
+        
+        local python_bin
+        python_bin=$(command -v python3)
+        local py_raw_ver py_ver
+        py_raw_ver=$("$python_bin" -V 2>&1)
+        py_raw_ver="${py_raw_ver#Python }"
+        py_ver="${py_raw_ver%.*}"
+        
+        local libdir="$envdir/lib/python${py_ver}/site-packages"
+        mkdir -p "$libdir"
+        local venv_bin="$envdir/bin"
+        mkdir -p "$venv_bin"
+        ln -sf "$python_bin" "$venv_bin/python3"
+        ln -sf "$python_bin" "$venv_bin/python"
+        
+        __log "Environment initialized for project '$project_name'." -t success -l py
+    }
+
+
+    __py_helper_lib() {
+        local action="$1"; shift
+        local proj="" args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p|--proj|--project) proj="$2"; shift 2 ;;
+                *) args+=("$1"); shift ;;
+            esac
+        done
+        
+        if [[ -z "$proj" ]]; then
+            __py_load_omnirc
+            local root_dir
+            root_dir=$(__py_helper_find_root 2>/dev/null) || root_dir="$PWD"
+            for p in "${!PY_PROJS[@]}"; do
+                if [[ "${PY_PROJS[$p]}" == "dir:$root_dir" ]]; then
+                    proj="$p"
+                    break
+                fi
+            done
+            [[ -z "$proj" ]] && proj=$(__py_get_proj_name)
+        fi
+        
+        case "$action" in
+            i|install) __py_helper_lib_install "$proj" "${args[@]}" ;;
+            u|uninstall) __py_helper_lib_uninstall "$proj" "${args[@]}" ;;
+            up|update) __py_helper_lib_update "$proj" "${args[@]}" ;;
+            access|.) __py_helper_lib_access "$proj" "${args[@]}" ;;
+            ls|list) __py_helper_lib_ls "$proj" "${args[@]}" ;;
+            sync) __py_helper_lib_sync "$proj" "${args[@]}" ;;
+            *) __log "Unknown lib command." -t error -l py; return 1 ;;
+        esac
+    }
+
+    __py_helper_lib_sync() {
+        local proj="$1"; shift
+        local src="" dst=""
+        
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -f|--from) src="$2"; shift 2 ;;
+                -t|--to) dst="$2"; shift 2 ;;
+                -*) shift ;;
+                *)
+                    if [[ -z "$src" ]]; then src="$1"
+                    elif [[ -z "$dst" ]]; then dst="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+        
+        [[ -z "$src" || -z "$dst" ]] && return 1
+        
+        local root lockfile
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        lockfile="$root/py.lock"
+        
+        if [[ "$src" == "lock" && "$dst" == "omnirc" ]]; then
+            [[ -f "$lockfile" ]] && source "$lockfile"
+            declare -gA PY_LIB 2>/dev/null || true
+            __py_load_omnirc
+            local new_libs=""
+            for k in "${!PY_LIB[@]}"; do
+                new_libs="${new_libs}${new_libs:+ }$k"
+            done
+            PY_PROJ_LIBS["$proj"]="$new_libs"
+            __py_save_omnirc
+            __log "Synced libs from lock to omnirc for '$proj'." -t success -l py
+        elif [[ "$src" == "omnirc" && "$dst" == "lock" ]]; then
+            __py_load_omnirc
+            local cur_libs="${PY_PROJ_LIBS[$proj]:-}"
+            declare -gA PY_LIB 2>/dev/null || true
+            [[ -f "$lockfile" ]] && source "$lockfile"
+            local lib
+            for lib in $cur_libs; do
+                [[ -z "${PY_LIB[$lib]:-}" ]] && PY_LIB["$lib"]="lib:${lib},provider:pypi,version:latest"
+            done
+            {
+                echo "declare -gA PY_LIB 2>/dev/null || true"
+                for k in "${!PY_LIB[@]}"; do echo "PY_LIB[\"$k\"]=\"${PY_LIB[$k]}\""; done
+            } > "$lockfile"
+            __log "Synced libs from omnirc to lock for '$proj'." -t success -l py
+        fi
+    }
+
+    __py_helper_lib_ls() {
+        local proj="$1"; shift
+        __py_load_omnirc
+        local cur_libs="${PY_PROJ_LIBS[$proj]:-}"
+        local -A seen=()
+        local unique=""
+        local lib
+        for lib in $cur_libs; do
+            if [[ -z "${seen[$lib]:-}" ]]; then
+                seen["$lib"]=1
+                unique="${unique}${unique:+ }$lib"
+            fi
+        done
+        if [[ "$cur_libs" != "$unique" ]]; then
+            PY_PROJ_LIBS["$proj"]="$unique"
+            __py_save_omnirc
+        fi
+        echo "Libraries for '$proj': ${unique:-None}"
+    }   
+
+    __py_helper_lib_install() {
+        local proj="$1"; shift
+        local lib="" from_prov="" as_name="" version="latest" lockfile=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -f|--from) from_prov="$2"; shift 2 ;;
+                -a|--as) as_name="$2"; shift 2 ;;
+                --version) version="$2"; shift 2 ;;
+                -*) shift 2 ;;
+                *) lib="$1"; shift 1 ;;
+            esac
+        done
+        [[ -z "$lib" ]] && return 1
+        [[ -z "$from_prov" ]] && { [[ "$lib" == */* ]] && from_prov="github" || from_prov="pypi"; }
+        [[ -z "$as_name" ]] && as_name="${lib##*/}"
+        
+        local target="$lib"
+        if [[ "$from_prov" == "github" ]]; then
+            target="git+https://github.com/${lib}.git"
+            [[ "$version" != "latest" ]] && target="${target}@${version}"
+        elif [[ "$version" != "latest" ]]; then
+            target="${lib}==${version}"
+        fi
+
+        local root site_dir
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        site_dir=$(__py_helper_site_dir "")
+        lockfile="$root/py.lock"
+
+        local venv_bin="$root/.venv/bin"
+        local ret=0
+        
+        if [[ -x "$venv_bin/pip" ]]; then
+            "$venv_bin/pip" install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        elif [[ -x "$venv_bin/python3" ]]; then
+            "$venv_bin/python3" -m pip install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        else
+            python3 -m pip install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        fi
+        
+        if (( ret != 0 )); then
+            __log "Failed to install library '$as_name'." -t error -l py
+            return "$ret"
+        fi
+        
+        [[ -f "$lockfile" ]] && source "$lockfile"
+        declare -gA PY_LIB 2>/dev/null || true
+        PY_LIB["$as_name"]="lib:${lib},provider:${from_prov},version:${version}"
+        {
+            echo "declare -gA PY_LIB 2>/dev/null || true"
+            for k in "${!PY_LIB[@]}"; do echo "PY_LIB[\"$k\"]=\"${PY_LIB[$k]}\""; done
+        } > "$lockfile"
+
+        __py_load_omnirc
+        local cur_libs="${PY_PROJ_LIBS[$proj]:-}"
+        if [[ " $cur_libs " != *" $as_name "* ]]; then
+            [[ -n "$cur_libs" ]] && cur_libs+=" "
+            PY_PROJ_LIBS["$proj"]="${cur_libs}${as_name}"
+            __py_save_omnirc
+        fi
+        
+        __log "Library '$as_name' registered and installed to project '$proj'." -t success -l py
+    }   
+
+    __py_helper_lib_uninstall() {
+        local proj="$1"; shift
+        local lib="$1"; shift
+        [[ -z "$lib" ]] && return 1
+        
+        local root lockfile
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        lockfile="$root/py.lock"
+        
+        [[ -f "$lockfile" ]] && source "$lockfile"
+        declare -gA PY_LIB 2>/dev/null || true
+        if [[ -n "${PY_LIB[$lib]:-}" ]]; then
+            unset 'PY_LIB[$lib]'
+            {
+                echo "declare -gA PY_LIB 2>/dev/null || true"
+                for k in "${!PY_LIB[@]}"; do echo "PY_LIB[\"$k\"]=\"${PY_LIB[$k]}\""; done
+            } > "$lockfile"
+        fi
+        
+        __py_load_omnirc
+        local cur_libs="${PY_PROJ_LIBS[$proj]:-}"
+        local new_libs=""
+        for l in $cur_libs; do
+            [[ "$l" != "$lib" ]] && new_libs="${new_libs}${new_libs:+ }$l"
+        done
+        PY_PROJ_LIBS["$proj"]="$new_libs"
+        __py_save_omnirc
+        
+        __log "Library '$lib' removed from project '$proj'." -t success -l py
+    }   
+
+    __py_helper_lib_update() {
+        local proj="$1"; shift
+        local lib="$1"; shift
+        [[ -z "$lib" ]] && return 1
+
+        local root site_dir
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        site_dir=$(__py_helper_site_dir "")
+        local lockfile="$root/py.lock"
+
+        local target="$lib"
+        local from_prov="pypi"
+        local version="latest"
+
+        if [[ -f "$lockfile" ]]; then
+            source "$lockfile"
+            declare -gA PY_LIB 2>/dev/null || true
+            if [[ -n "${PY_LIB[$lib]:-}" ]]; then
+                local lib_info="${PY_LIB[$lib]}"
+                
+                local extract="${lib_info##*lib:}"
+                local lib_val="${extract%%,*}"
+                
+                extract="${lib_info##*provider:}"
+                from_prov="${extract%%,*}"
+                
+                extract="${lib_info##*version:}"
+                version="${extract%%,*}"
+                
+                if [[ "$from_prov" == "github" ]]; then
+                    target="git+https://github.com/${lib_val}.git"
+                    [[ "$version" != "latest" && -n "$version" ]] && target="${target}@${version}"
+                else
+                    target="$lib_val"
+                    [[ "$version" != "latest" && -n "$version" ]] && target="${target}==${version}"
+                fi
+            fi
+        fi
+
+        local venv_bin="$root/.venv/bin"
+        local ret=0
+
+        __log "Updating '$lib' in project '$proj'..." -t info -l py
+
+        if [[ -x "$venv_bin/pip" ]]; then
+            "$venv_bin/pip" install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        elif [[ -x "$venv_bin/python3" ]]; then
+            "$venv_bin/python3" -m pip install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        else
+            python3 -m pip install --upgrade --break-system-packages --target "$site_dir" "$target" || ret=$?
+        fi
+
+        if (( ret != 0 )); then
+            __log "Failed to update library '$lib'." -t error -l py
+            return "$ret"
+        fi
+
+        __log "Library '$lib' successfully updated." -t success -l py
+    }   
+
+    __py_helper_lib_access() {
+        local proj="$1"; shift
+        local dep_name="$1"
+        local env=""
+        local site_pkg_dir
+        site_pkg_dir=$(__py_helper_site_dir "$env")
+        if [[ -d "$site_pkg_dir/$dep_name" ]]; then
+            cd "$site_pkg_dir/$dep_name" || return 1
+            "${SHELL:-bash}"
+        else
+            __log "Dependency '$dep_name' not found." -t error -l py
+            return 1
+        fi
+    }
+
+    __py_helper_dep() {
+        local action="$1"; shift
+        local proj="" args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p|--proj|--project) proj="$2"; shift 2 ;;
+                *) args+=("$1"); shift ;;
+            esac
+        done
+        
+        if [[ -z "$proj" ]]; then
+            __py_load_omnirc
+            local root_dir
+            root_dir=$(__py_helper_find_root 2>/dev/null) || root_dir="$PWD"
+            for p in "${!PY_PROJS[@]}"; do
+                if [[ "${PY_PROJS[$p]}" == "dir:$root_dir" ]]; then
+                    proj="$p"
+                    break
+                fi
+            done
+            [[ -z "$proj" ]] && proj=$(__py_get_proj_name)
+        fi
+        
+        case "$action" in
+            add) __py_helper_dep_add "$proj" "${args[@]}" ;;
+            rm|remove) __py_helper_dep_rm "$proj" "${args[@]}" ;;
+            ls|list) __py_helper_dep_ls "$proj" "${args[@]}" ;;
+            *) __log "Unknown dep command." -t error -l py; return 1 ;;
+        esac
+    }
+
+    __py_helper_dep_add() {
+        local proj="$1"; shift
+        local dep_name="$1"
+        [[ -z "$dep_name" ]] && return 1
+
+        local root pyproject req_file
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        pyproject="$root/pyproject.toml"
+        req_file="$root/requirements.txt"
+
+        if [[ -f "$pyproject" ]]; then
+            local tmp="${pyproject}.tmp"
+            awk -v spec="$dep_name" '
+                BEGIN { in_deps = 0; added = 0 }
+                $0 ~ /^[[:space:]]*dependencies[[:space:]]*=/ && in_deps == 0 { in_deps = 1; print; next }
+                in_deps == 1 && $0 ~ /\]/ { printf "    \"%s\",\n", spec; added = 1; in_deps = 0; print; next }
+                { print }
+                END { if (added == 0) { print ""; print "dependencies = ["; printf "    \"%s\",\n", spec; print "]" } }
+            ' "$pyproject" > "$tmp" && mv "$tmp" "$pyproject"
+        fi
+
+        if [[ -f "$req_file" ]]; then
+            echo "$dep_name" >> "$req_file"
+        fi
+
+        __py_load_omnirc
+        local cur_deps="${PY_PROJ_DEPS[$proj]:-}"
+        [[ -n "$cur_deps" ]] && cur_deps+=" "
+        PY_PROJ_DEPS["$proj"]="${cur_deps}${dep_name}"
+        __py_save_omnirc
+
+        __log "Dependency '$dep_name' added to project '$proj'." -t success -l py
+    }
+
+    __py_helper_dep_rm() {
+        local proj="$1"; shift
+        local dep_name="$1"
+        [[ -z "$dep_name" ]] && return 1
+
+        local root pyproject req_file
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        pyproject="$root/pyproject.toml"
+        req_file="$root/requirements.txt"
+
+        if [[ -f "$pyproject" ]]; then
+            local tmp="${pyproject}.tmp"
+            awk -v spec="$dep_name" '
+                { if ($0 !~ "\""spec"\"") print $0 }
+            ' "$pyproject" > "$tmp" && mv "$tmp" "$pyproject"
+        fi
+
+        if [[ -f "$req_file" ]]; then
+            local tmp_req="${req_file}.tmp"
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" != "$dep_name" ]] && printf "%s\n" "$line"
+            done < "$req_file" > "$tmp_req"
+            mv "$tmp_req" "$req_file"
+        fi
+
+        __py_load_omnirc
+        local cur_deps="${PY_PROJ_DEPS[$proj]:-}"
+        local new_deps=""
+        for d in $cur_deps; do
+            [[ "$d" != "$dep_name" ]] && new_deps="${new_deps}${new_deps:+ }$d"
+        done
+        PY_PROJ_DEPS["$proj"]="$new_deps"
+        __py_save_omnirc
+
+        __log "Dependency '$dep_name' removed from project '$proj'." -t success -l py
+    }
+
+    __py_helper_dep_ls() {
+        local proj="$1"; shift
+        local file="" mode="all"
+        
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -i|--installed) mode="installed"; shift ;;
+                -m|--missing) mode="missing"; shift ;;
+                -o|--optional) mode="optional"; shift ;;
+                -a|--all) mode="all"; shift ;;
+                -*) shift ;;
+                *) file="$1"; shift ;;
+            esac
+        done
+        
+        local root
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        [[ -z "$file" ]] && file="$root/pyproject.toml"
+        [[ ! -f "$file" ]] && { __log "File not found: $file" -t error -l py; return 1; }
+        
+        local site_dir
+        site_dir=$(__py_helper_site_dir "")
+        
+        local -a deps=()
+        if [[ "$file" == *.toml ]]; then
+            local in_deps=0 line spec
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" =~ ^[[:space:]]*dependencies[[:space:]]*= ]] && in_deps=1
+                if (( in_deps == 1 )); then
+                    [[ "$line" == *"]"* ]] && in_deps=0
+                    if [[ "$line" =~ \"([^\"]+)\" ]]; then
+                        spec="${BASH_REMATCH[1]}"
+                        deps+=("${spec%%[<>=!@]*}")
+                    fi
+                fi
+            done < "$file"
+        else
+            local line spec
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                spec="${line%%[<>=!@]*}"
+                deps+=("$spec")
+            done < "$file"
+        fi
+        
+        local d is_inst norm_d dist
+        for d in "${deps[@]}"; do
+            is_inst=0
+            norm_d="${d//-/_}"
+            
+            if [[ -d "$site_dir/$d" || -d "$site_dir/$norm_d" ]]; then
+                is_inst=1
+            else
+                for dist in "$site_dir"/"$d"-*.dist-info "$site_dir"/"$norm_d"-*.dist-info; do
+                    [[ -d "$dist" ]] && { is_inst=1; break; }
+                done
+            fi
+            
+            if [[ "$mode" == "all" ]]; then
+                (( is_inst == 1 )) && printf "%s (installed)\n" "$d" || printf "%s (missing)\n" "$d"
+            elif [[ "$mode" == "installed" ]] && (( is_inst == 1 )); then
+                printf "%s\n" "$d"
+            elif [[ "$mode" == "missing" ]] && (( is_inst == 0 )); then
+                printf "%s\n" "$d"
+            fi
+        done
+    } 
+
+
+    __py_helper_exec() {
+        [[ $# -eq 0 ]] && return 1
+
+        local root site_dir venv_bin py_bin
+        root=$(__py_helper_find_root 2>/dev/null) || root="$PWD"
+        venv_bin="$root/.venv/bin"
+        site_dir="$(__py_helper_site_dir 2>/dev/null)"
+
+        if [[ -x "$venv_bin/python3" ]]; then
+            py_bin="$venv_bin/python3"
+        elif [[ -x "$venv_bin/python" ]]; then
+            py_bin="$venv_bin/python"
+        else
+            py_bin="python3"
+        fi
+
+        if [[ "$1" == *.py ]]; then
+            [[ ! -f "$1" ]] && { printf "py:error: File not found: %s\n" "$1" >&2; return 1; }
+            VIRTUAL_ENV="$root/.venv" PYTHONPATH="$root:$site_dir${PYTHONPATH:+:$PYTHONPATH}" PATH="$venv_bin:$PATH" "$py_bin" "$@"
+        else
+            PATH="$venv_bin:$PATH" command -v "$1" >/dev/null 2>&1 || { printf "py:error: Command not found: %s\n" "$1" >&2; return 127; }
+            VIRTUAL_ENV="$root/.venv" PYTHONPATH="$root:$site_dir${PYTHONPATH:+:$PYTHONPATH}" PATH="$venv_bin:$PATH" "$@"
+        fi
+    }
+
+}

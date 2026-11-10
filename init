@@ -1,0 +1,157 @@
+#! /bin/bash
+
+_PY_DIR_RAW="${BASH_SOURCE[0]%/*}"
+[[ "$_PY_DIR_RAW" == "${BASH_SOURCE[0]}" ]] && _PY_DIR_RAW="."
+_PY_DIR="$(cd "$_PY_DIR_RAW" && pwd)"
+
+__py__() {
+    __load script helper --from "$_PY_DIR/mods"
+
+    __py__.__help__() {
+        cat <<'EOF' >&2
+USAGE:
+    py [action] [flags]
+ACTIONS:
+    init .................... initialize an environment
+    provider ................ manage providers
+    proj .................... manage projects (set, ls, rm, build, push, version)
+    lib ..................... manage libraries (install, uninstall, update, access)
+    dep ..................... manage dependencies (add, rm, ls)
+    x, exec, run ............ execute some file or command
+FLAGS:
+    -e, --env ..................... exec action in some environment
+    -p, --proj, --project ......... exec action for a specific project
+EOF
+    }
+
+    __py__.__aliases__() {
+        alias px="py exec"
+    }
+
+    __py__.__compl__() {
+        local cur="${COMP_WORDS[COMP_CWORD]:-}"
+        local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
+        local raw_cmd="${COMP_WORDS[1]:-}"
+        local cmd="$raw_cmd"
+        
+        case "$raw_cmd" in
+            init) cmd="init" ;;
+            provider) cmd="provider" ;;
+            proj) cmd="proj" ;;
+            lib) cmd="lib" ;;
+            dep) cmd="dep" ;;
+            exec|run|x) cmd="exec" ;;
+            help|-h|--help) cmd="help" ;;
+        esac
+
+        if [[ $COMP_CWORD -eq 1 ]]; then
+            COMPREPLY=($(compgen -W "init reinit provider proj lib dep exec build push version" -- "$cur"))
+            return 0
+        fi
+
+        case "$cmd" in
+            provider)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=($(compgen -W "set new ls rm" -- "$cur"))
+                fi
+                ;;
+            proj)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=($(compgen -W "set new ls rm build push publish version" -- "$cur"))
+                elif [[ "$prev" == "version" || "$prev" == "v" ]]; then
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=($(compgen -W "--from --help" -- "$cur"))
+                    else
+                        COMPREPLY=($(compgen -W "up down" -- "$cur"))
+                    fi
+                elif [[ "$prev" == "push" || "$prev" == "publish" ]]; then
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=($(compgen -W "--registry --env --user --pass --url --help" -- "$cur"))
+                    fi
+                elif [[ "$prev" == "build" ]]; then
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=($(compgen -W "--env --help" -- "$cur"))
+                    fi
+                elif [[ $COMP_CWORD -eq 4 && "${COMP_WORDS[COMP_CWORD-2]}" == "version" ]]; then
+                    if [[ "$prev" == "up" || "$prev" == "down" ]]; then
+                        COMPREPLY=($(compgen -W "patch minor major" -- "$cur"))
+                    elif [[ "$prev" == "--from" ]]; then
+                        COMPREPLY=($(compgen -W "git" -- "$cur"))
+                    fi
+                fi
+                ;;
+            lib)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=($(compgen -W "install uninstall update access sync" -- "$cur"))
+                elif [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "--from --as --project --version" -- "$cur"))
+                elif [[ "$prev" == "u" || "$prev" == "uninstall" || "$prev" == "up" || "$prev" == "update" ]]; then
+                    local lock_pkgs=""
+                    if [[ -f py.lock ]]; then
+                        local line pkg
+                        while IFS= read -r line || [[ -n "$line" ]]; do
+                            if [[ "$line" == PY_LIB\[* ]]; then
+                                pkg="${line#*\[\"}"
+                                pkg="${pkg%%\"\]*}"
+                                lock_pkgs="${lock_pkgs}${lock_pkgs:+ }${pkg}"
+                            fi
+                        done < py.lock
+                    fi
+                    COMPREPLY=($(compgen -W "$lock_pkgs" -- "$cur"))
+                elif [[ "$prev" == "i" || "$prev" == "install" ]]; then
+                    local dep_pkgs="" pyproject="" root_dir="$PWD"
+                    while [[ -n "$root_dir" && "$root_dir" != "/" ]]; do
+                        if [[ -f "$root_dir/pyproject.toml" ]]; then
+                            pyproject="$root_dir/pyproject.toml"
+                            break
+                        fi
+                        root_dir="${root_dir%/*}"
+                    done
+                    if [[ -f "$pyproject" ]]; then
+                        local in_deps=0 line spec
+                        while IFS= read -r line || [[ -n "$line" ]]; do
+                            [[ "$line" =~ ^[[:space:]]*dependencies[[:space:]]*= ]] && in_deps=1
+                            if (( in_deps == 1 )); then
+                                [[ "$line" == *"]"* ]] && in_deps=0
+                                if [[ "$line" =~ \"([^\"]+)\" ]]; then
+                                    spec="${BASH_REMATCH[1]}"
+                                    dep_pkgs="${dep_pkgs}${dep_pkgs:+ }${spec%%[<>=!@]*}"
+                                fi
+                            fi
+                        done < "$pyproject"
+                    fi
+                    COMPREPLY=($(compgen -W "$dep_pkgs" -- "$cur"))
+                fi
+                ;;
+            dep)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=($(compgen -W "add rm ls" -- "$cur"))
+                elif [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "--project" -- "$cur"))
+                fi
+                ;;
+        esac
+    }   
+
+    py() {
+        local cmd="$1"
+        [[ -z "$cmd" || "$cmd" == "--help" || "$cmd" == "-h" ]] && { __py__.__help__; return 0; }
+        shift
+
+        case "$cmd" in
+            init) __py_helper_init "$@" ;;
+            reinit) __py_helper_reinit "$@" ;;
+            provider) __py_helper_provider "$@" ;;
+            proj) __py_helper_proj "$@" ;;
+            lib) __py_helper_lib "$@" ;;
+            dep) __py_helper_dep "$@" ;;
+            x|exec|run) __py_helper_exec "$@" ;;
+            *) __log "Option '$cmd' not defined." -t error -l py; return 1 ;;
+        esac
+    }
+
+    __py__.__init__() {
+        __compl py
+        __aliases py
+    }
+}
